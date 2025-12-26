@@ -158,22 +158,21 @@ class MainActivity : AppCompatActivity() {
 
 ## Architecture
 
-SyncManager is built around a clear state machine:
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design decisions.
 
+### State Machine
 ```
-Idle → Bonding → Connecting → Syncing → Success / Failed
+Idle → Bonding → Connecting → Syncing → Success/Failed
 ```
 
-Errors are typed as:
+### Error Hierarchy
+- **Transient** (retriable): BondingFailed, ConnectionFailed, ReadFailed, etc.
+- **Permanent** (non-retriable): DeviceNotBonded, InvalidState, Timeout
 
-* **Transient**: retriable (BondingFailed, ConnectionFailed, ReadFailed, etc.)
-* **Permanent**: non-retriable (DeviceNotBonded, InvalidState, Timeout)
-
-Retry policy:
-
-* Default: 3 retries, 1s → 30s backoff
-* Aggressive: 5 retries, 500ms → 15s backoff
-* Conservative: 3 retries, 2s → 60s backoff
+### Retry Policy
+- **Default**: 3 retries, 1s→30s backoff
+- **Aggressive**: 5 retries, 500ms→15s backoff
+- **Conservative**: 3 retries, 2s→60s backoff
 
 ## Future Enhancements
 

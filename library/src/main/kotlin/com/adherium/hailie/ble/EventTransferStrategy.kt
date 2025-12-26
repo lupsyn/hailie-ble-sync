@@ -121,13 +121,13 @@ class ChunkedEventTransferStrategy(
             allEvents.addAll(chunk)
             offset += chunk.size
 
-            // Acknowledge in batches to reduce BLE traffic
+            // if we have completed a full batch or we are on the last partial batch
             if (offset % ackBatchSize == 0 || offset >= totalEvents) {
                 acknowledgeEvents(connection, offset)
             }
         }
 
-        // Final acknowledgment
+        // Final acknowledgment if there are additional events
         if (offset > 0 && offset % ackBatchSize != 0) {
             acknowledgeEvents(connection, totalEvents)
         }

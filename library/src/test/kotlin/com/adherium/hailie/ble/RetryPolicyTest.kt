@@ -22,9 +22,9 @@ class RetryPolicyTest {
         val delay2 = policy.calculateDelay(2)
 
         // Then - should roughly double (without jitter)
-        assertTrue(delay0 >= 90 && delay0 <= 110) // ~100ms
-        assertTrue(delay1 >= 180 && delay1 <= 220) // ~200ms
-        assertTrue(delay2 >= 360 && delay2 <= 440) // ~400ms
+        assertTrue(delay0 in 90..110) // ~100ms
+        assertTrue(delay1 in 180..220) // ~200ms
+        assertTrue(delay2 in 360..440) // ~400ms
     }
 
     @Test

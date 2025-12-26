@@ -187,7 +187,7 @@ class SyncManagerTest {
         // Then
         assertIs<SyncResult.Failure>(result)
         assertIs<SyncError.InvalidState>(result.error)
-        assertTrue(result.error.message?.contains("bonding") == true)
+        assertEquals(result.error.message.contains("bonding"), true)
     }
 
     @Test

@@ -1,7 +1,5 @@
 # BLE Sync Manager Architecture
 
-## Narrative Overview
-
 The BLE Sync Manager is designed to provide reliable and predictable synchronization with Hailie smart inhaler devices in an environment where Bluetooth Low Energy (BLE) behavior is inherently unstable. Real-world usage regularly exposes issues such as unreliable pairing, fragile connections, and inconsistent data transfer rates.
 
 Rather than masking these issues with opaque automation, the Sync Manager makes each step of the synchronization process explicit and observable. The system favors deterministic behavior, clear state transitions, and carefully controlled retries so that failures are understandable, diagnosable, and recoverable.
