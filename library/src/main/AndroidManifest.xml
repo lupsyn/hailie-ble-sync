@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+    This is a library module.
+    Permissions should be declared in the consuming app's manifest.
+
+    Required permissions for BLE functionality:
+    - android.permission.BLUETOOTH
+    - android.permission.BLUETOOTH_ADMIN
+    - android.permission.BLUETOOTH_CONNECT (Android 12+)
+    - android.permission.BLUETOOTH_SCAN (Android 12+)
+
+    Required features:
+    - android.hardware.bluetooth_le
+    -->
+</manifest>
