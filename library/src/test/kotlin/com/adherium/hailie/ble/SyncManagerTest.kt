@@ -57,9 +57,7 @@ class SyncManagerTest {
     }
 
     @After
-    fun tearDown() {
-        clearAllMocks()
-    }
+    fun tearDown() = clearAllMocks()
 
     @Test
     fun `sync succeeds with bonded device and valid events`() = runTest {
@@ -393,4 +391,255 @@ class SyncManagerTest {
         assertEquals(SyncState.Idle, syncManager.syncState.value)
         coVerify { sensor.disconnect() }
     }
+
+    @Test
+    fun `sync invokes callback after events are acknowledged`() = runTest {
+        // Given
+        val acknowledgedBatches = mutableListOf<List<ActuationEvent>>()
+
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(3)
+        coEvery { connection.readEvents(0, 2) } returns Result.success(testEvents.take(2))
+        coEvery { connection.readEvents(2, 1) } returns Result.success(testEvents.takeLast(1))
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = { events ->
+                acknowledgedBatches.add(events)
+            }
+        )
+
+        // Then
+        assertIs<SyncResult.Success>(result)
+
+        // Callback should have been invoked once with all 3 events
+        // (chunkSize=2, ackBatchMultiplier=2, so ackBatchSize=4, meaning all 3 fit in one batch)
+        assertEquals(1, acknowledgedBatches.size)
+        assertEquals(3, acknowledgedBatches[0].size)
+        assertEquals(testEvents, acknowledgedBatches[0])
+    }
+
+    @Test
+    fun `sync invokes callback multiple times for multiple batches`() = runTest {
+        // Given
+        val manyEvents = (1..10).map {
+            ActuationEvent("$it", Instant.now(), "device-1", 1)
+        }
+        val acknowledgedBatches = mutableListOf<List<ActuationEvent>>()
+
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(10)
+        coEvery { connection.readEvents(any(), any()) } answers {
+            val offset = firstArg<Int>()
+            val count = secondArg<Int>()
+            Result.success(manyEvents.subList(offset, minOf(offset + count, manyEvents.size)))
+        }
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = { events ->
+                acknowledgedBatches.add(events)
+            }
+        )
+
+        // Then
+        assertIs<SyncResult.Success>(result)
+
+        // With chunkSize=2 and ackBatchMultiplier=2, ackBatchSize=4
+        // 10 events should trigger: batch of 4, batch of 4, batch of 2
+        assertEquals(3, acknowledgedBatches.size)
+        assertEquals(4, acknowledgedBatches[0].size)
+        assertEquals(4, acknowledgedBatches[1].size)
+        assertEquals(2, acknowledgedBatches[2].size)
+
+        // All events should have been delivered
+        val allAcknowledged = acknowledgedBatches.flatten()
+        assertEquals(10, allAcknowledged.size)
+        assertEquals(manyEvents, allAcknowledged)
+    }
+
+    // ========== CALLBACK ERROR HANDLING TESTS ==========
+
+    @Test
+    fun `sync fails if callback throws exception during persistence`() = runTest {
+        // Given
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(3)
+        coEvery { connection.readEvents(0, 2) } returns Result.success(testEvents.take(2))
+        coEvery { connection.readEvents(2, 1) } returns Result.success(testEvents.takeLast(1))
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        var callbackInvoked = false
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = { events ->
+                callbackInvoked = true
+                throw IllegalStateException("Database write failed!")
+            }
+        )
+
+        // Then - sync should fail with the callback exception
+        assertIs<SyncResult.Failure>(result)
+        assertIs<SyncError.InvalidState>(result.error)
+        assertTrue(callbackInvoked, "Callback should have been invoked")
+        assertTrue(result.error.message!!.contains("Unexpected error"))
+    }
+
+    @Test
+    fun `sync callback receives events in correct order across multiple batches`() = runTest {
+        // Given
+        val orderedEvents = (1..8).map {
+            ActuationEvent("event-$it", Instant.now(), "device-$it", it)
+        }
+        val receivedEvents = mutableListOf<ActuationEvent>()
+
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(8)
+        coEvery { connection.readEvents(any(), any()) } answers {
+            val offset = firstArg<Int>()
+            val count = secondArg<Int>()
+            Result.success(orderedEvents.subList(offset, offset + count))
+        }
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = { events ->
+                receivedEvents.addAll(events)
+            }
+        )
+
+        // Then
+        assertIs<SyncResult.Success>(result)
+        assertEquals(8, receivedEvents.size)
+        // Verify events are in the same order as sent
+        assertEquals(orderedEvents, receivedEvents)
+    }
+
+    @Test
+    fun `sync callback is not invoked if connection fails before reading events`() = runTest {
+        // Given
+        var callbackInvoked = false
+        coEvery { sensor.connect() } returns Result.failure(Exception("Connection failed"))
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = {
+                callbackInvoked = true
+            }
+        )
+
+        // Then
+        assertIs<SyncResult.Failure>(result)
+        assertTrue(!callbackInvoked, "Callback should not be invoked if connection fails")
+    }
+
+    @Test
+    fun `sync callback is not invoked if read fails before acknowledgment`() = runTest {
+        // Given
+        var callbackInvoked = false
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(3)
+        coEvery { connection.readEvents(any(), any()) } returns Result.failure(Exception("Read failed"))
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = {
+                callbackInvoked = true
+            }
+        )
+
+        // Then
+        assertIs<SyncResult.Failure>(result)
+        assertTrue(!callbackInvoked, "Callback should not be invoked if read fails")
+    }
+
+    @Test
+    fun `sync without callback parameter uses default empty callback`() = runTest {
+        // Given
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(3)
+        coEvery { connection.readEvents(0, 2) } returns Result.success(testEvents.take(2))
+        coEvery { connection.readEvents(2, 1) } returns Result.success(testEvents.takeLast(1))
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When - sync without callback parameter (uses default)
+        val result = syncManager.sync()
+
+        // Then - should succeed even without explicit callback
+        assertIs<SyncResult.Success>(result)
+        assertEquals(3, result.events.size)
+    }
+
+    // ========== CONCURRENT SYNC EDGE CASES ==========
+
+    @Test
+    fun `concurrent sync calls with callbacks are properly serialized`() = runTest {
+        // Given
+        val callback1Events = mutableListOf<ActuationEvent>()
+        val callback2Events = mutableListOf<ActuationEvent>()
+
+        coEvery { sensor.connect() } coAnswers {
+            kotlinx.coroutines.delay(50) // Simulate slow connection
+            Result.success(connection)
+        }
+        coEvery { connection.readEventCount() } returns Result.success(2)
+        coEvery { connection.readEvents(any(), any()) } returns Result.success(testEvents.take(2))
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When - launch two syncs concurrently with different callbacks
+        val job1 = launch {
+            syncManager.sync(onEventsAcknowledged = { callback1Events.addAll(it) })
+        }
+        val job2 = launch {
+            syncManager.sync(onEventsAcknowledged = { callback2Events.addAll(it) })
+        }
+
+        job1.join()
+        job2.join()
+
+        // Then - both should have completed with their own callbacks
+        assertEquals(2, callback1Events.size)
+        assertEquals(2, callback2Events.size)
+
+        // Should have connected twice (serialized, not concurrent)
+        coVerify(exactly = 2) { sensor.connect() }
+    }
+
+    @Test
+    fun `sync returns all events even with callback parameter`() = runTest {
+        // Given
+        val callbackEvents = mutableListOf<ActuationEvent>()
+
+        coEvery { sensor.connect() } returns Result.success(connection)
+        coEvery { connection.readEventCount() } returns Result.success(3)
+        coEvery { connection.readEvents(0, 2) } returns Result.success(testEvents.take(2))
+        coEvery { connection.readEvents(2, 1) } returns Result.success(testEvents.takeLast(1))
+        coEvery { connection.acknowledgeEvents(any()) } returns Result.success(Unit)
+        coEvery { sensor.disconnect() } just Runs
+
+        // When
+        val result = syncManager.sync(
+            onEventsAcknowledged = { callbackEvents.addAll(it) }
+        )
+
+        // Then
+        assertIs<SyncResult.Success>(result)
+
+        // Both result AND callback should have all events
+        assertEquals(3, result.events.size)
+        assertEquals(3, callbackEvents.size)
+        assertEquals(testEvents, result.events)
+        assertEquals(testEvents, callbackEvents)
+    }
 }
+

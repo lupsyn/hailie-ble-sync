@@ -33,26 +33,19 @@ class ExponentialBackoffRetryStrategy(
     ): T {
         var lastError: Throwable? = null
 
-        for (attempt in 0..retryPolicy.maxRetries) {
+        repeat(retryPolicy.maxRetries + 1) { attempt ->
             try {
                 // Delay before retry (no delay on first attempt)
                 retryPolicy.delayForAttempt(attempt)
 
-                // Execute with timeout
-                val result = withTimeout(operationTimeoutMs) {
+                // Execute with timeout and return on success
+                return withTimeout(operationTimeoutMs) {
                     operation()
-                }
-
-                return result.getOrThrow()
+                }.getOrThrow()
 
             } catch (e: Exception) {
                 lastError = e
-
-                // Don't retry on last attempt - let it fall through to throw
-                if (attempt >= retryPolicy.maxRetries) {
-                    break
-                }
-                // Otherwise, continue to next retry attempt
+                // Continue to next retry attempt unless this was the last
             }
         }
 

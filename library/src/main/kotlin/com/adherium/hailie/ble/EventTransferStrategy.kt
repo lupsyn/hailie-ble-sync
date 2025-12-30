@@ -48,16 +48,27 @@ interface EventTransferStrategy {
      * The strategy determines how to chunk the reads, when to acknowledge, and
      * how to handle errors during transfer.
      *
+     * ## Important: Persistence Responsibility
+     * The [onEventsAcknowledged] callback is invoked immediately after events are
+     * acknowledged on the device. **The caller MUST persist these events before
+     * returning from the callback** to prevent data loss if the app crashes.
+     * Once events are acknowledged, they are removed from the device and cannot
+     * be re-read.
+     *
      * @param connection Active GATT connection to read from
      * @param totalEvents Total number of events to transfer
      * @param onProgress Callback for progress updates (offset, total)
+     * @param onEventsAcknowledged Callback invoked after events are acknowledged.
+     *        Receives the list of events that were just acknowledged. The caller
+     *        must persist these events to avoid data loss.
      * @return List of all transferred events
      * @throws SyncError If transfer fails after retry attempts
      */
     suspend fun transferEvents(
         connection: GattConnection,
         totalEvents: Int,
-        onProgress: (SyncState.SyncProgress) -> Unit
+        onProgress: (SyncState.SyncProgress) -> Unit,
+        onEventsAcknowledged: (List<ActuationEvent>) -> Unit = {}
     ): List<ActuationEvent>
 }
 
@@ -72,7 +83,16 @@ interface EventTransferStrategy {
  * 1. Read events in chunks of [chunkSize]
  * 2. Report progress after each chunk
  * 3. Acknowledge every [ackBatchSize] events
- * 4. Final acknowledgment after all events transferred
+ * 4. Invoke [onEventsAcknowledged] callback immediately after acknowledgment
+ * 5. Final acknowledgment after all events transferred
+ *
+ * ## Data Safety
+ * To prevent data loss during crashes:
+ * - The [onEventsAcknowledged] callback is invoked **immediately after** each batch
+ *   is acknowledged on the device
+ * - The caller **must persist** these events before returning from the callback
+ * - Once acknowledged, events are removed from the device and cannot be re-read
+ * - This ensures acknowledged events are never lost, even if the app crashes mid-sync
  *
  * ## Performance Characteristics
  * - **Chunk size 50**: Balances MTU constraints with round-trip reduction
@@ -96,13 +116,13 @@ class ChunkedEventTransferStrategy(
     override suspend fun transferEvents(
         connection: GattConnection,
         totalEvents: Int,
-        onProgress: (SyncState.SyncProgress) -> Unit
+        onProgress: (SyncState.SyncProgress) -> Unit,
+        onEventsAcknowledged: (List<ActuationEvent>) -> Unit
     ): List<ActuationEvent> {
-        if (totalEvents == 0) {
-            return emptyList()
-        }
+        if (totalEvents == 0) return emptyList()
 
         val allEvents = mutableListOf<ActuationEvent>()
+        val acknowledgedEvents = mutableListOf<ActuationEvent>()
         var offset = 0
 
         // Read events in chunks
@@ -118,18 +138,26 @@ class ChunkedEventTransferStrategy(
                 errorMapper = { SyncError.ReadFailed("Failed to read events at offset $offset: $it", offset) }
             )
 
-            allEvents.addAll(chunk)
+            allEvents += chunk
+            acknowledgedEvents += chunk
             offset += chunk.size
 
             // if we have completed a full batch or we are on the last partial batch
             if (offset % ackBatchSize == 0 || offset >= totalEvents) {
                 acknowledgeEvents(connection, offset)
+                // Callback with acknowledged events for persistence
+                onEventsAcknowledged(acknowledgedEvents.toList())
+                acknowledgedEvents.clear()
             }
         }
 
         // Final acknowledgment if there are additional events
         if (offset > 0 && offset % ackBatchSize != 0) {
             acknowledgeEvents(connection, totalEvents)
+            // Callback with any remaining acknowledged events
+            acknowledgedEvents.takeIf { it.isNotEmpty() }?.let { events ->
+                onEventsAcknowledged(events.toList())
+            }
         }
 
         return allEvents

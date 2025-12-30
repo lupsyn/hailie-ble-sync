@@ -1,24 +1,36 @@
 package com.adherium.hailie.sample
 
 import android.os.Bundle
+import android.util.Log
 import android.widget.Button
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.isVisible
-import androidx.lifecycle.lifecycleScope
-import com.adherium.hailie.ble.*
-import com.adherium.hailie.ble.retry.RetryPolicy
-import kotlinx.coroutines.launch
+import androidx.work.Constraints
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.workDataOf
+import java.util.UUID
 
 /**
- * Sample app demonstrating Hailie BLE Sync Manager integration.
+ * Sample app demonstrating Hailie BLE Sync Manager integration with WorkManager.
  *
  * This demonstrates:
- * - Library integration
- * - State observation
- * - Sync execution
- * - UI updates based on sync state
+ * - Background sync with WorkManager
+ * - Work observation and progress tracking
+ * - Sync execution with persistent event storage
+ * - UI updates based on work status
+ * - Critical: Event persistence callback to prevent data loss
+ *
+ * ## Background Sync
+ * Sync operations run in a background Worker, allowing users to leave the app
+ * while sync completes. This provides better UX for long-running BLE operations.
+ *
+ * ## Data Safety
+ * Events are persisted incrementally via the [onEventsAcknowledged] callback
+ * in the Worker to prevent data loss if the app crashes mid-sync.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -27,7 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var syncButton: Button
     private lateinit var eventsText: TextView
 
-    private lateinit var syncManager: SyncManager
+    private var currentWorkId: UUID? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,126 +51,138 @@ class MainActivity : AppCompatActivity() {
         syncButton = findViewById(R.id.syncButton)
         eventsText = findViewById(R.id.eventsText)
 
-        // Create sync manager with mock sensor for demo
-        // In production, replace with actual HailieSensor implementation
-        val mockSensor = MockHailieSensor(
-            deviceId = "demo-hailie-001",
-            failureRate = 0.0, // No failures for demo
-            eventCount = 25
-        )
-
-        syncManager = SyncManager(
-            sensor = mockSensor,
-            retryPolicy = RetryPolicy.DEFAULT
-        )
-
-        // Observe sync state
-        lifecycleScope.launch {
-            syncManager.syncState.collect { state ->
-                updateUI(state)
-            }
-        }
-
         // Sync button click
         syncButton.setOnClickListener {
-            performSync()
+            startBackgroundSync()
         }
 
         statusText.text = "Ready to sync"
     }
 
-    private fun updateUI(state: SyncState) {
-        when (state) {
-            is SyncState.Idle -> {
-                statusText.text = "Ready to sync"
-                progressBar.isVisible = false
-                syncButton.isEnabled = true
+    /**
+     * Starts a background sync operation using WorkManager.
+     *
+     * This enqueues a SyncWorker that will run in the background, allowing
+     * the user to leave the app while sync completes.
+     */
+    private fun startBackgroundSync() {
+        // Create work request with input data
+        val syncRequest = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setInputData(
+                workDataOf(
+                    SyncWorker.KEY_DEVICE_ID to "demo-hailie-001",
+                    SyncWorker.KEY_EVENT_COUNT to 1500,
+                    SyncWorker.KEY_RETRY_POLICY to "DEFAULT",
+                    SyncWorker.KEY_CHUNK_SIZE to 50
+                )
+            )
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiresBatteryNotLow(true) // Don't drain battery
+                    .build()
+            )
+            .build()
+
+        currentWorkId = syncRequest.id
+
+        // Enqueue the work
+        WorkManager.getInstance(this).enqueue(syncRequest)
+
+        // Observe work progress
+        WorkManager.getInstance(this)
+            .getWorkInfoByIdLiveData(syncRequest.id)
+            .observe(this) { workInfo ->
+                workInfo?.let { updateUIFromWorkInfo(it) }
             }
 
-            is SyncState.Bonding -> {
-                statusText.text = "Bonding with device..."
+        Log.d(TAG, "Sync work enqueued: ${syncRequest.id}")
+    }
+
+    /**
+     * Updates UI based on WorkInfo state and progress.
+     */
+    private fun updateUIFromWorkInfo(workInfo: WorkInfo) {
+        when (workInfo.state) {
+            WorkInfo.State.ENQUEUED -> {
+                statusText.text = "Sync queued..."
                 progressBar.isVisible = true
                 progressBar.isIndeterminate = true
                 syncButton.isEnabled = false
             }
 
-            is SyncState.Connecting -> {
-                statusText.text = "Connecting to device..."
-                progressBar.isVisible = true
-                progressBar.isIndeterminate = true
-                syncButton.isEnabled = false
-            }
+            WorkInfo.State.RUNNING -> {
+                // Check for progress updates
+                val currentOffset = workInfo.progress.getInt(SyncWorker.KEY_PROGRESS_CURRENT, 0)
+                val totalEvents = workInfo.progress.getInt(SyncWorker.KEY_PROGRESS_TOTAL, 0)
+                val percentage = workInfo.progress.getInt(SyncWorker.KEY_PROGRESS_PERCENTAGE, 0)
 
-            is SyncState.Syncing -> {
-                val progress = state.progress
-                statusText.text = "Syncing: ${progress.currentOffset}/${progress.totalEvents} events"
-                progressBar.isVisible = true
-                progressBar.isIndeterminate = false
-                progressBar.max = 100
-                progressBar.progress = progress.percentage
-                syncButton.isEnabled = false
-            }
-
-            is SyncState.Success -> {
-                statusText.text = "✓ Sync complete: ${state.eventsSynced} events"
-                progressBar.isVisible = false
-                syncButton.isEnabled = true
-            }
-
-            is SyncState.Failed -> {
-                statusText.text = "✗ Sync failed: ${state.error.message}"
-                progressBar.isVisible = false
-                syncButton.isEnabled = true
-
-                if (state.canRetry) {
-                    syncButton.text = "Retry Sync"
+                if (totalEvents > 0) {
+                    // Show determinate progress
+                    statusText.text = "Syncing: $currentOffset/$totalEvents events ($percentage%)"
+                    progressBar.isVisible = true
+                    progressBar.isIndeterminate = false
+                    progressBar.max = 100
+                    progressBar.progress = percentage
                 } else {
-                    syncButton.text = "Check Device & Retry"
+                    // No progress data yet, show indeterminate
+                    statusText.text = "Syncing in background..."
+                    progressBar.isVisible = true
+                    progressBar.isIndeterminate = true
                 }
+                syncButton.isEnabled = false
+            }
+
+            WorkInfo.State.SUCCEEDED -> {
+                val eventsSynced = workInfo.outputData.getInt(SyncWorker.KEY_EVENTS_SYNCED, 0)
+                val deviceId = workInfo.outputData.getString(SyncWorker.KEY_DEVICE_ID)
+
+                statusText.text = "✓ Sync complete: $eventsSynced events from $deviceId"
+                progressBar.isVisible = false
+                syncButton.isEnabled = true
+                syncButton.text = "Sync Device"
+
+                eventsText.text = "Synced $eventsSynced events successfully!\n\n" +
+                        "Events are persisted in the background worker.\n" +
+                        "In production, query them from your database."
+
+                Log.d(TAG, "Sync completed successfully: $eventsSynced events")
+            }
+
+            WorkInfo.State.FAILED -> {
+                val errorMessage = workInfo.outputData.getString(SyncWorker.KEY_ERROR_MESSAGE)
+                val deviceId = workInfo.outputData.getString(SyncWorker.KEY_DEVICE_ID)
+
+                statusText.text = "✗ Sync failed for $deviceId"
+                progressBar.isVisible = false
+                syncButton.isEnabled = true
+                syncButton.text = "Retry Sync"
+
+                eventsText.text = "Error Details:\n$errorMessage"
+
+                Log.e(TAG, "Sync failed: $errorMessage")
+            }
+
+            WorkInfo.State.CANCELLED -> {
+                statusText.text = "Sync cancelled"
+                progressBar.isVisible = false
+                syncButton.isEnabled = true
+                syncButton.text = "Sync Device"
+
+                Log.d(TAG, "Sync cancelled")
+            }
+
+            WorkInfo.State.BLOCKED -> {
+                statusText.text = "Sync blocked (waiting for constraints)"
+                progressBar.isVisible = true
+                progressBar.isIndeterminate = true
+                syncButton.isEnabled = false
+
+                Log.d(TAG, "Sync blocked")
             }
         }
     }
 
-    private fun performSync() {
-        lifecycleScope.launch {
-            syncButton.text = "Syncing..."
-
-            when (val result = syncManager.sync()) {
-                is SyncResult.Success -> {
-                    // Display synced events
-                    val eventsList = result.events.take(10).joinToString("\n") { event ->
-                        "• ${event.id}: ${event.puffs} puffs at ${event.timestamp}"
-                    }
-
-                    val summary = if (result.events.size > 10) {
-                        "$eventsList\n... and ${result.events.size - 10} more"
-                    } else {
-                        eventsList
-                    }
-
-                    eventsText.text = "Synced Events:\n$summary"
-                }
-
-                is SyncResult.Failure -> {
-                    val errorType = when (result.error) {
-                        is SyncError.BondingFailed -> "Bonding"
-                        is SyncError.ConnectionFailed -> "Connection"
-                        is SyncError.ConnectionLost -> "Connection Lost"
-                        is SyncError.ReadFailed -> "Data Read"
-                        is SyncError.AcknowledgeFailed -> "Acknowledgment"
-                        is SyncError.DeviceNotBonded -> "Not Bonded"
-                        is SyncError.InvalidState -> "Invalid State"
-                        is SyncError.Timeout -> "Timeout"
-                    }
-
-                    eventsText.text = "Error Details:\n" +
-                            "Type: $errorType\n" +
-                            "Message: ${result.error.message}\n" +
-                            "Can Retry: ${result.error.isTransient}"
-                }
-            }
-
-            syncButton.text = "Sync Device"
-        }
+    companion object {
+        private const val TAG = "MainActivity"
     }
 }

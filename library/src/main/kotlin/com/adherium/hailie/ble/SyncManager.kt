@@ -41,9 +41,14 @@ import kotlinx.coroutines.sync.withLock
  *     }
  * }
  *
- * // Execute sync
- * when (val result = syncManager.sync()) {
- *     is SyncResult.Success -> persistEvents(result.events)
+ * // Execute sync with persistence callback
+ * when (val result = syncManager.sync(
+ *     onEventsAcknowledged = { events ->
+ *         // CRITICAL: Persist events immediately to prevent data loss
+ *         database.insertEvents(events)
+ *     }
+ * )) {
+ *     is SyncResult.Success -> showSuccess(result.events.size)
  *     is SyncResult.Failure -> handleError(result.error)
  * }
  * ```
@@ -113,14 +118,32 @@ class SyncManager(
      * - **State updates**: [syncState] is updated throughout the operation
      * - **Device cleanup**: GATT connection is always disconnected on completion
      *
+     * ## Data Safety
+     * The [onEventsAcknowledged] callback is invoked immediately after each batch of
+     * events is acknowledged on the device. **You MUST persist these events in the
+     * callback** to prevent data loss if the app crashes mid-sync. Once acknowledged,
+     * events are removed from the device and cannot be re-read.
+     *
+     * ## Progress Tracking
+     * The [onProgress] callback is invoked after each chunk is read, providing real-time
+     * progress updates for UI rendering. The percentage is calculated as
+     * `(currentOffset * 100) / totalEvents`.
+     *
      * ## Error Handling
      * Transient errors (connection failures, etc.) are retried automatically.
      * Permanent errors (device not bonded, etc.) fail immediately.
      *
+     * @param onEventsAcknowledged Callback invoked after events are acknowledged on device.
+     *        **Required**: Persist these events before returning to prevent data loss.
+     * @param onProgress Optional callback for progress updates. Receives current offset,
+     *        total events, and percentage (0-100). Useful for updating progress bars.
      * @return [SyncResult.Success] with synced events, or [SyncResult.Failure] with error details
      * @throws CancellationException if the coroutine is cancelled
      */
-    suspend fun sync(): SyncResult = syncMutex.withLock {
+    suspend fun sync(
+        onEventsAcknowledged: (List<ActuationEvent>) -> Unit = {},
+        onProgress: (currentOffset: Int, totalEvents: Int, percentage: Int) -> Unit = { _, _, _ -> }
+    ): SyncResult = syncMutex.withLock {
         try {
             _syncState.value = SyncState.Idle
 
@@ -131,7 +154,7 @@ class SyncManager(
             val connection = establishConnection()
 
             // Step 3: Sync events
-            val events = syncEvents(connection)
+            val events = syncEvents(connection, onEventsAcknowledged, onProgress)
 
             _syncState.value = SyncState.Success(events.size)
             SyncResult.Success(events)
@@ -155,9 +178,7 @@ class SyncManager(
     private suspend fun ensureBonded() {
         when (sensor.bondState.value) {
             BondState.BONDED -> return
-            BondState.BONDING -> {
-                throw SyncError.InvalidState("Device is currently bonding")
-            }
+            BondState.BONDING -> throw SyncError.InvalidState("Device is currently bonding")
             BondState.NONE -> {
                 _syncState.value = SyncState.Bonding
                 retryStrategy.executeWithRetry(
@@ -173,7 +194,7 @@ class SyncManager(
      */
     private suspend fun establishConnection(): GattConnection {
         // Verify device is bonded first
-        if (sensor.bondState.value != BondState.BONDED) {
+        require(sensor.bondState.value == BondState.BONDED) {
             throw SyncError.DeviceNotBonded("Cannot connect to unbonded device")
         }
 
@@ -188,30 +209,32 @@ class SyncManager(
     /**
      * Syncs all events from the device using the transfer strategy.
      */
-    private suspend fun syncEvents(connection: GattConnection): List<ActuationEvent> {
+    private suspend fun syncEvents(
+        connection: GattConnection,
+        onEventsAcknowledged: (List<ActuationEvent>) -> Unit,
+        onProgress: (currentOffset: Int, totalEvents: Int, percentage: Int) -> Unit
+    ): List<ActuationEvent> {
         // Read total event count
         val totalEvents = retryStrategy.executeWithRetry(
             operation = { connection.readEventCount() },
             errorMapper = { SyncError.ReadFailed("Failed to read event count: $it", 0) }
         )
 
-        if (totalEvents == 0) {
-            return emptyList()
-        }
+        if (totalEvents == 0) return emptyList()
 
         // Delegate event transfer to strategy
-        val events = transferStrategy.transferEvents(
+        return transferStrategy.transferEvents(
             connection = connection,
             totalEvents = totalEvents,
             onProgress = { progress ->
                 _syncState.value = SyncState.Syncing(progress)
-            }
-        )
-
-        // Cleanup
-        sensor.disconnect()
-
-        return events
+                onProgress(progress.currentOffset, progress.totalEvents, progress.percentage)
+            },
+            onEventsAcknowledged = onEventsAcknowledged
+        ).also {
+            // Cleanup
+            sensor.disconnect()
+        }
     }
 
     /**
