@@ -85,12 +85,84 @@ The architecture reflects a series of deliberate trade-offs:
 
 ---
 
+## Data Safety and Incremental Persistence
+
+To prevent data loss during mid-sync crashes, the architecture implements an incremental persistence pattern via the `onEventsAcknowledged` callback.
+
+When events are acknowledged on the device, they are immediately removed from device memory and cannot be re-read. To ensure these events survive app crashes, the callback is invoked **immediately after acknowledgment** with the batch of acknowledged events.
+
+```kotlin
+syncManager.sync(
+    onEventsAcknowledged = { events ->
+        // CRITICAL: Persist these events before returning
+        // Once acknowledged, they cannot be recovered from the device
+        database.insertEvents(events)
+    }
+)
+```
+
+This pattern follows the **Dependency Inversion Principle**—the library does not dictate storage implementation. The caller can persist to Room, SQLite, files, cloud storage, or any other mechanism. The sync library only ensures the callback is invoked at the correct time in the lifecycle.
+
+**Lifecycle guarantee:**
+```
+Read chunk → Acknowledge on device → Invoke callback → Clear temp buffer
+```
+
+If the app crashes after the callback returns, the events are already persisted. If it crashes during the callback, the database transaction (if used) will roll back, and the events remain on the device for the next sync attempt.
+
+---
+
+## Background Synchronization with WorkManager
+
+BLE sync operations are inherently long-running and can take several minutes for devices with thousands of events. Blocking the UI thread during this time creates poor user experience.
+
+The architecture now includes `SyncWorker`, a `CoroutineWorker` that executes sync operations in the background using Android's WorkManager. This provides several critical benefits:
+
+* **User freedom:** Users can leave the app, switch tasks, or lock the screen while sync continues
+* **Automatic retry:** WorkManager handles retry logic for failed work
+* **Constraint-based scheduling:** Sync only when battery is sufficient, device is charging, etc.
+* **Process survival:** Work survives process death and app updates
+* **OS-level optimization:** Android schedules work efficiently across the system
+
+**Background sync architecture:**
+```
+MainActivity → WorkManager.enqueue(SyncWorker)
+                    ↓
+SyncWorker creates SyncManager in background thread
+                    ↓
+SyncManager.sync() with onEventsAcknowledged
+                    ↓
+Events persisted incrementally in Worker
+                    ↓
+WorkInfo.State.SUCCEEDED → UI shows result
+```
+
+The Worker reports progress via `WorkInfo.State` and outputs results via `Data`, allowing UI components to observe long-running sync operations without maintaining direct references to the sync manager.
+
+**Example usage:**
+```kotlin
+val syncRequest = OneTimeWorkRequestBuilder<SyncWorker>()
+    .setInputData(workDataOf(
+        SyncWorker.KEY_DEVICE_ID to deviceId,
+        SyncWorker.KEY_CHUNK_SIZE to 150,
+        SyncWorker.KEY_RETRY_POLICY to "AGGRESSIVE"
+    ))
+    .setConstraints(Constraints.Builder()
+        .setRequiresBatteryNotLow(true)
+        .build())
+    .build()
+
+WorkManager.getInstance(context).enqueue(syncRequest)
+```
+
+This architectural pattern scales naturally to multiple devices by enqueuing multiple Workers in parallel, with each maintaining independent retry state and progress reporting.
+
+---
+
 ## Future Extension Points
 
-The design intentionally leaves room for future enhancements, including:
+The design intentionally leaves room for additional enhancements, including:
 
-* Resuming sync from the last acknowledged offset
-* Background synchronization via WorkManager
+* Resuming sync from the last acknowledged offset (partial recovery -TBD on the GATT behaviour)
 * Adaptive retry policies based on historical failure patterns
-* Parallel synchronization across multiple devices
-* Event deduplication and clock drift correction
+* Foreground Service for long-running syncs requiring immediate visibility

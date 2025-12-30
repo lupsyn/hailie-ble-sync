@@ -9,14 +9,15 @@ Hailie BLE Sync Manager is an Android library for robust Bluetooth Low Energy sy
 * **Chunked Data Transfer**: Optimized batch reading and acknowledgment for performance and stability.
 * **Graceful Error Handling**: Typed errors with transient and permanent classifications to inform retry decisions.
 * **Concurrency Safe**: Mutex-protected operations prevent overlapping syncs.
-* **Comprehensive Testing**: Unit tests with MockK covering normal and edge-case scenarios.
+* **Data Safety**: Incremental event persistence via callback prevents data loss on crashes.
+* **Background Sync**: WorkManager integration for long-running operations without blocking UI.
+* **Performance Tuning**: Configurable chunk sizes and retry policies for optimal sync speed.
 
 ## Prerequisites
 
 * **Android Studio** Hedgehog | 2023.1.1 or later
 * **JDK 17+**
 * **Android SDK**:
-
     * compileSdk 34
     * minSdk 24
 * **Gradle 8.4+** (via wrapper)
@@ -74,7 +75,8 @@ Or run from Android Studio.
 ```kotlin
 dependencies {
     implementation(files("libs/hailie-ble-sync-release.aar"))
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    implementation("androidx.work:work-runtime-ktx:2.10.0") // For background sync
 }
 ```
 
@@ -102,7 +104,7 @@ class AndroidHailieSensor(
 }
 ```
 
-### Use SyncManager
+### Option 1: Direct Sync with Event Persistence
 
 ```kotlin
 class MainActivity : AppCompatActivity() {
@@ -131,11 +133,60 @@ class MainActivity : AppCompatActivity() {
 
     fun onSyncButtonClick() {
         lifecycleScope.launch {
-            when (val result = syncManager.sync()) {
+            when (val result = syncManager.sync(
+                onEventsAcknowledged = { events ->
+                    // CRITICAL: Persist events immediately to prevent data loss
+                    database.insertEvents(events)
+                }
+            )) {
                 is SyncResult.Success -> processEvents(result.events)
                 is SyncResult.Failure -> handleError(result.error)
             }
         }
+    }
+}
+```
+
+### Option 2: Background Sync with WorkManager (Recommended)
+
+```kotlin
+class MainActivity : AppCompatActivity() {
+
+    fun onSyncButtonClick() {
+        // Create background sync request
+        val syncRequest = OneTimeWorkRequestBuilder<SyncWorker>()
+            .setInputData(workDataOf(
+                SyncWorker.KEY_DEVICE_ID to deviceId,
+                SyncWorker.KEY_CHUNK_SIZE to 150,  // Performance optimization
+                SyncWorker.KEY_RETRY_POLICY to "AGGRESSIVE"
+            ))
+            .setConstraints(Constraints.Builder()
+                .setRequiresBatteryNotLow(true)
+                .build())
+            .build()
+
+        // Enqueue work
+        WorkManager.getInstance(this).enqueue(syncRequest)
+
+        // Observe progress
+        WorkManager.getInstance(this)
+            .getWorkInfoByIdLiveData(syncRequest.id)
+            .observe(this) { workInfo ->
+                when (workInfo.state) {
+                    WorkInfo.State.RUNNING -> updateUI("Syncing in background...")
+                    WorkInfo.State.SUCCEEDED -> {
+                        val eventsSynced = workInfo.outputData
+                            .getInt(SyncWorker.KEY_EVENTS_SYNCED, 0)
+                        showSuccess("Synced $eventsSynced events")
+                    }
+                    WorkInfo.State.FAILED -> {
+                        val error = workInfo.outputData
+                            .getString(SyncWorker.KEY_ERROR_MESSAGE)
+                        showError(error)
+                    }
+                    else -> { /* Handle other states */ }
+                }
+            }
     }
 }
 ```
@@ -174,19 +225,48 @@ Idle → Bonding → Connecting → Syncing → Success/Failed
 - **Aggressive**: 5 retries, 500ms→15s backoff
 - **Conservative**: 3 retries, 2s→60s backoff
 
-## Future Enhancements
+## Performance Optimization
 
-### High Priority
+See [PERFORMANCE_OPTIMIZATION.md](PERFORMANCE_OPTIMIZATION.md) for detailed performance tuning guidance.
 
-These are features critical to the reliability and correctness of the library. Integration tests with real or simulated BLE devices are essential to validate behavior under varying radio conditions and firmware versions. Partial sync recovery ensures that if a connection drops, the library can resume from the last acknowledged offset rather than starting over, saving time and reducing user frustration. Connection state monitoring allows the system to detect unexpected disconnects and react gracefully, either by alerting the user or attempting a controlled reconnection. Adaptive retry policies will analyze past failures and automatically adjust retry timing and counts to maximize success without overwhelming the device or radio.
+**Quick wins:**
+- Increase chunk size to 100-150 for faster sync
+- Use `RetryPolicy.AGGRESSIVE` for time-critical operations
+- Leverage WorkManager for background sync (already implemented!)
+- For multiple devices, sync in parallel with separate Workers
 
-### Medium Priority
+**Example optimized configuration:**
+```kotlin
+val syncManager = SyncManager(
+    sensor = sensor,
+    retryPolicy = RetryPolicy.AGGRESSIVE,  // Faster retries
+    chunkSize = 150,                       // Larger chunks
+    operationTimeoutMs = 20000L            // Shorter timeout
+)
+```
 
-Medium priority items improve user experience and operational efficiency. Background sync via WorkManager allows data synchronization without requiring the app to be in the foreground, optimizing battery usage and user convenience. Multi-device sync support lets multiple smartinhalers be synchronized in parallel or sequentially, aggregating results for a more comprehensive view. Enhanced observability and structured logging provide developers with insight into performance metrics, BLE operations, and error patterns, simplifying debugging and future optimizations.
+## Recent Enhancements
 
-### Low Priority
+### ✅ Implemented
 
-Low priority items focus on fine-tuning and long-term maintainability. Configuration tuning, such as adjusting chunk sizes or operation timeouts, enables optimized performance across different devices and network conditions. Security improvements, including event data encryption and certificate pinning, enhance compliance and data integrity. Developer tooling, like sample apps, BLE simulators, and debug overlays, lowers the learning curve for new users and simplifies development and testing workflows.
+* **Incremental Event Persistence**: `onEventsAcknowledged` callback prevents data loss on crashes
+* **Background Sync**: WorkManager integration for long-running operations
+* **Performance Tuning**: Configurable chunk sizes and retry policies
+* **Parallel Sync**: Support for syncing multiple devices simultaneously
+
+### TODO list
+
+#### High Priority
+
+Integration tests with real or simulated BLE devices are essential to validate behavior under varying radio conditions and firmware versions. 
+
+#### Medium Priority
+
+Multi-device sync orchestration with aggregated progress reporting. Enhanced observability and structured logging.
+
+#### Low Priority
+
+Security improvements, including event data encryption and certificate pinning, enhance compliance and data integrity.
 
 ## Design Considerations
 
